@@ -1,14 +1,8 @@
+use std::fs::File;
+
 use clap::{Arg, ArgAction, Command};
 use fs::LazyHTTPFS;
-use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    Request,
-};
-use libc::ENOENT;
-use log::info;
-use std::ffi::OsStr;
-use std::fs::File;
-use std::time::{Duration, UNIX_EPOCH};
+use fuser::MountOption;
 
 mod fs;
 
@@ -51,16 +45,12 @@ fn main() {
         options.push(MountOption::AllowRoot);
     }
 
-    let a = File::open(matches.get_one::<String>("LAYOUT").unwrap()).unwrap_or_else(|e| {
-        eprintln!("ERROR: {}", e);
-        // todo figure out a better terminate method
-        panic!();
-    });
-
-    match serde_json::from_reader(a) {
-        Ok(data) => {
+    let a = File::open(matches.get_one::<String>("LAYOUT").unwrap()).map(serde_json::from_reader);
+    match a {
+        Ok(Ok(data)) => {
             fuser::mount2(LazyHTTPFS::new(data), mountpoint, &options).unwrap();
         }
-        Err(e) => eprintln!("ERROR: {}", e),
+        Ok(Err(e)) => eprintln!("Error parsing JSON: {}", e),
+        Err(e) => eprintln!("IO Error: {}", e),
     }
 }

@@ -72,7 +72,7 @@ fn add_inodes(files: &[InputFile], inode: &mut u64) -> Vec<Node> {
         ctime: UNIX_EPOCH,
         crtime: UNIX_EPOCH,
         kind: FileType::RegularFile,
-        perm: 0o644,
+        perm: 0o444,
         nlink: 1,
         uid: 1000,
         gid: 1000,
@@ -164,7 +164,7 @@ const TTL: Duration = Duration::from_secs(1000000);
 
 impl LazyHTTPFS {
     fn get_inode(&self, i: u64) -> Option<&Node> {
-        if (i == 0) {
+        if i == 0 {
             None
         } else {
             self.nodes.get(i as usize - 1)
@@ -222,7 +222,7 @@ impl Filesystem for LazyHTTPFS {
         _req: &fuser::Request<'_>,
         ino: u64,
         _fh: u64,
-        mut offset: i64,
+        offset: i64,
         mut reply: fuser::ReplyDirectory,
     ) {
         let parent_dir = &self.get_inode(ino);
@@ -267,11 +267,11 @@ impl Filesystem for LazyHTTPFS {
         &mut self,
         _req: &fuser::Request<'_>,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         offset: i64,
         size: u32,
-        flags: i32,
-        lock_owner: Option<u64>,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
         if let Some(Node::FileNode(file)) = self.get_inode(ino) {
@@ -302,10 +302,6 @@ impl Filesystem for LazyHTTPFS {
 
 #[cfg(test)]
 mod test {
-    use std::collections::HashSet;
-
-    use fuser::Filesystem;
-
     use super::{Directory, InputFile, LazyHTTPFS, URLFile};
 
     const JSON: &str = r#"

@@ -1,0 +1,14 @@
+[
+  {
+    "name": "helloworld.txt",
+    "size": 220,
+    "url": "https://foobar.com"
+  },{
+  "directory": [
+    {
+      "name": "inner.txt",
+      "size": 220,
+      "url": "https://bob.com"
+    }
+  ]}
+]

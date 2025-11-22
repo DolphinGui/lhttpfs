@@ -9,7 +9,7 @@
     {
       "name": "inner.txt",
       "size": 25,
-      "url": "http://ping.archlinux.org/nm-check.txt"
+      "url": "https://ping.archlinux.org/nm-check.txt"
     }
   ]}
 ]

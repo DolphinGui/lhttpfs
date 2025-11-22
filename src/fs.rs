@@ -72,7 +72,7 @@ fn add_inodes(files: &[InputFile], inode: &mut u64) -> Vec<Node> {
         ctime: UNIX_EPOCH,
         crtime: UNIX_EPOCH,
         kind: FileType::RegularFile,
-        perm: 0o444,
+        perm: 0o644,
         nlink: 1,
         uid: 1000,
         gid: 1000,
@@ -101,6 +101,7 @@ fn add_inodes(files: &[InputFile], inode: &mut u64) -> Vec<Node> {
                 result.push(Node::DirNode(DirNode {
                     attr: FileAttr {
                         ino: *inode,
+                        kind: FileType::Directory,
                         ..attr
                     },
                     contents: HashMap::new(),
@@ -210,7 +211,7 @@ impl Filesystem for LazyHTTPFS {
         _fh: Option<u64>,
         reply: fuser::ReplyAttr,
     ) {
-        match self.nodes.get(ino as usize) {
+        match self.get_inode(ino) {
             Some(file) => reply.attr(&TTL, &file.get_attr()),
             None => reply.error(ENOENT),
         }
@@ -221,23 +222,27 @@ impl Filesystem for LazyHTTPFS {
         _req: &fuser::Request<'_>,
         ino: u64,
         _fh: u64,
-        offset: i64,
+        mut offset: i64,
         mut reply: fuser::ReplyDirectory,
     ) {
-        let parent_dir = &self.nodes[ino as usize];
+        let parent_dir = &self.get_inode(ino);
         match parent_dir {
-            Node::DirNode(dir) => {
-                dir.contents
-                    .iter()
-                    .filter_map(|(filename, inode)| {
-                        self.nodes
-                            .get(*inode as usize)
-                            .map(|file| (*inode, filename, file))
-                    })
+            Some(Node::DirNode(dir)) => {
+                trace!("Directory contents: {:?}, offset {}", dir.contents, offset);
+                let dots = [
+                    (ino, &OsString::from("."), FileType::Directory),
+                    (ino, &OsString::from(".."), FileType::Directory),
+                ];
+                dots.into_iter()
+                    .chain(dir.contents.iter().filter_map(|(filename, inode)| {
+                        self.get_inode(*inode)
+                            .map(|file| (*inode, filename, file.filetype()))
+                    }))
                     .enumerate()
                     .skip(offset as usize)
                     .try_for_each(|(i, (inode, name, file))| -> Option<()> {
-                        if reply.add(inode, (i + 1) as i64, file.filetype(), name) {
+                        if reply.add(inode, (i + 1) as i64, file, name) {
+                            trace!("READDIR listing file {}: {:?}", inode, name);
                             Some(())
                         } else {
                             None
@@ -245,11 +250,14 @@ impl Filesystem for LazyHTTPFS {
                     });
                 reply.ok();
             }
-            Node::FileNode(file_node) => {
+            Some(Node::FileNode(file_node)) => {
                 error!(
                     "Inode {}, url {} was erroneously used in readdir() as a parent directory",
                     ino, file_node.url
                 );
+                reply.error(ENOENT);
+            }
+            None => {
                 reply.error(ENOENT);
             }
         };
@@ -266,7 +274,7 @@ impl Filesystem for LazyHTTPFS {
         lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
-        if let Some(Node::FileNode(file)) = self.nodes.get(ino as usize) {
+        if let Some(Node::FileNode(file)) = self.get_inode(ino) {
             if let Some(data) = self.cache.get(&file.url) {
                 reply.data(&data[offset as usize..]);
                 return;

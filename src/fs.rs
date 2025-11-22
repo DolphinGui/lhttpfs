@@ -7,7 +7,8 @@ use std::{
 use curl::easy::Easy;
 use fuser::{FileAttr, FileType, Filesystem};
 use libc::ENOENT;
-use log::error;
+use log::{error, trace};
+use serde::Deserialize;
 
 pub struct LazyHTTPFS {
     nodes: Vec<Node>,
@@ -16,36 +17,52 @@ pub struct LazyHTTPFS {
     cache: HashMap<String, Vec<u8>>,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
 pub enum InputFile {
     URLFile(URLFile),
     Directory(Directory),
 }
 
+impl InputFile {
+    fn name(&self) -> &str {
+        match self {
+            InputFile::URLFile(urlfile) => &urlfile.name,
+            InputFile::Directory(directory) => &directory.name,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct URLFile {
     name: String,
     url: String,
     size: usize,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct Directory {
     name: String,
     contents: Vec<InputFile>,
 }
 
 impl LazyHTTPFS {
-    fn new(files: Vec<InputFile>, capacity: usize) -> LazyHTTPFS {
-        let mut nodes = Vec::with_capacity(capacity + 1);
-
-        let mut inode = 0;
-        add_inodes(files, &mut nodes, &mut inode);
+    pub fn new(files: Vec<InputFile>) -> LazyHTTPFS {
+        let mut inode = 1;
+        let root = InputFile::Directory(Directory {
+            name: "/".into(),
+            contents: files,
+        });
+        let mut r = add_inodes(&[root], &mut inode);
+        r.sort_unstable_by_key(|f| f.get_attr().ino);
         LazyHTTPFS {
-            nodes,
+            nodes: r,
             cache: HashMap::new(),
         }
     }
 }
 
-fn add_inodes(files: &[InputFile], nodes: &mut Vec<Node>, inode: &mut u64) {
+fn add_inodes(files: &[InputFile], inode: &mut u64) -> Vec<Node> {
     let attr = FileAttr {
         ino: 0,
         size: 0,
@@ -63,34 +80,52 @@ fn add_inodes(files: &[InputFile], nodes: &mut Vec<Node>, inode: &mut u64) {
         blksize: 512,
         flags: 0,
     };
-
+    let mut result = Vec::new();
     for file in files {
         match file {
-            InputFile::URLFile(urlfile) => nodes.push(Node::FileNode(FileNode {
-                attr: FileAttr {
-                    ino: *inode,
-                    size: urlfile.size as u64,
-                    blocks: urlfile.size as u64 / 512,
-                    ..attr
-                },
-                url: urlfile.url.clone(),
-            })),
+            InputFile::URLFile(urlfile) => {
+                trace!("Inserting {}: {:?}", *inode, urlfile);
+                result.push(Node::FileNode(FileNode {
+                    attr: FileAttr {
+                        ino: *inode,
+                        size: urlfile.size as u64,
+                        blocks: urlfile.size as u64 / 512,
+                        ..attr
+                    },
+                    url: urlfile.url.clone(),
+                }));
+                *inode += 1;
+            }
             InputFile::Directory(dir) => {
-                let ino = *inode;
-                add_inodes(&dir.contents, nodes, inode);
-                nodes.push(Node::DirNode(DirNode {
+                trace!("Inserting {}: {:?}", *inode, dir);
+                result.push(Node::DirNode(DirNode {
                     attr: FileAttr {
                         ino: *inode,
                         ..attr
                     },
-                    contents: todo!(),
+                    contents: HashMap::new(),
                 }));
+                let dir_index = result.len() - 1;
+                *inode += 1;
+                let results = add_inodes(&dir.contents, inode);
+                let inodes = results
+                    .iter()
+                    .zip(&dir.contents)
+                    .map(|(f, input)| (OsString::from(input.name()), f.get_attr().ino))
+                    .collect();
+                result.extend(results.into_iter());
+                if let Some(Node::DirNode(n)) = result.get_mut(dir_index) {
+                    n.contents = inodes;
+                } else {
+                    panic!("Directory indexing failed!");
+                }
             }
         }
-        *inode += 1;
     }
+    result
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum Node {
     DirNode(DirNode),
     FileNode(FileNode),
@@ -112,17 +147,29 @@ impl Node {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct DirNode {
     attr: FileAttr,
     contents: HashMap<OsString, u64>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct FileNode {
     attr: FileAttr,
     url: String,
 }
 
 const TTL: Duration = Duration::from_secs(1000000);
+
+impl LazyHTTPFS {
+    fn get_inode(&self, i: u64) -> Option<&Node> {
+        if (i == 0) {
+            None
+        } else {
+            self.nodes.get(i as usize - 1)
+        }
+    }
+}
 
 impl Filesystem for LazyHTTPFS {
     fn lookup(
@@ -132,12 +179,15 @@ impl Filesystem for LazyHTTPFS {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        let parent_dir = &self.nodes[parent as usize];
+        trace!("Searching for {:?} with parent {}", name, parent);
+        let Some(parent_dir) = self.get_inode(parent) else {
+            reply.error(ENOENT);
+            return;
+        };
         match parent_dir {
             Node::DirNode(dir_node) => {
                 let f = dir_node.contents.get(name);
-                if let Some(inode) = f {
-                    let file = &self.nodes[*inode as usize];
+                if let Some(file) = f.and_then(|i| self.get_inode(*i)) {
                     reply.entry(&TTL, &file.get_attr(), 0)
                 } else {
                     reply.error(ENOENT)
@@ -216,13 +266,7 @@ impl Filesystem for LazyHTTPFS {
         lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
-        if let Some(file) = self.nodes.get(ino as usize).and_then(|f| {
-            if let Node::FileNode(f) = f {
-                Some(f)
-            } else {
-                None
-            }
-        }) {
+        if let Some(Node::FileNode(file)) = self.nodes.get(ino as usize) {
             if let Some(data) = self.cache.get(&file.url) {
                 reply.data(&data[offset as usize..]);
                 return;
@@ -244,6 +288,63 @@ impl Filesystem for LazyHTTPFS {
             self.cache.insert(file.url.clone(), vec);
         } else {
             reply.error(ENOENT);
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::collections::HashSet;
+
+    use fuser::Filesystem;
+
+    use super::{Directory, InputFile, LazyHTTPFS, URLFile};
+
+    const JSON: &str = r#"
+[
+  {
+    "name": "helloworld.txt",
+    "size": 25,
+    "url": "https://ping.archlinux.org/nm-check.txt"
+  },{
+    "name": "outer.dir",
+  "contents": [
+    {
+      "name": "inner.txt",
+      "size": 25,
+      "url": "https://ping.archlinux.org/nm-check.txt"
+    }
+  ]}
+]"#;
+
+    #[test]
+    fn deserialize() {
+        let result: Vec<InputFile> = serde_json::from_str(JSON).unwrap();
+        let expected: Vec<InputFile> = vec![
+            InputFile::URLFile(URLFile {
+                name: "helloworld.txt".into(),
+                url: "https://ping.archlinux.org/nm-check.txt".into(),
+                size: 25,
+            }),
+            InputFile::Directory(Directory {
+                name: "outer.dir".into(),
+                contents: vec![InputFile::URLFile(URLFile {
+                    name: "inner.txt".into(),
+                    url: "https://ping.archlinux.org/nm-check.txt".into(),
+                    size: 25,
+                })],
+            }),
+        ];
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn parsing() {
+        let result: Vec<InputFile> = serde_json::from_str(JSON).unwrap();
+        let fs = LazyHTTPFS::new(result);
+        for (inode, node) in fs.nodes.iter().enumerate() {
+            println!("{}: {:?}\n", inode + 1, node);
+            assert_eq!(inode as u64 + 1, node.get_attr().ino);
         }
     }
 }

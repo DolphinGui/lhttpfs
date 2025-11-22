@@ -1,14 +1,15 @@
 [
   {
     "name": "helloworld.txt",
-    "size": 220,
-    "url": "https://foobar.com"
+    "size": 25,
+    "url": "https://ping.archlinux.org/nm-check.txt"
   },{
-  "directory": [
+    "name": "outer.dir",
+  "contents": [
     {
       "name": "inner.txt",
-      "size": 220,
-      "url": "https://bob.com"
+      "size": 25,
+      "url": "http://ping.archlinux.org/nm-check.txt"
     }
   ]}
 ]

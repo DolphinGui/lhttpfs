@@ -1,10 +1,12 @@
-use std::fs::File;
+use std::{error::Error, fs::File};
 
 use clap::{Arg, ArgAction, Command};
 use fs::LazyHTTPFS;
 use fuser::MountOption;
 
 mod fs;
+
+type Result<T> = core::result::Result<T, Box<dyn Error>>;
 
 fn main() {
     let matches = Command::new("hello")
@@ -45,12 +47,18 @@ fn main() {
         options.push(MountOption::AllowRoot);
     }
 
-    let a = File::open(matches.get_one::<String>("LAYOUT").unwrap()).map(serde_json::from_reader);
+    let a: Result<_> = File::open(matches.get_one::<String>("LAYOUT").unwrap())
+        .map_err(From::from)
+        .and_then(|f| serde_json::from_reader(f).map_err(From::from))
+        .and_then(LazyHTTPFS::new);
+
     match a {
-        Ok(Ok(data)) => {
-            fuser::mount2(LazyHTTPFS::new(data), mountpoint, &options).unwrap();
+        Ok(data) => {
+            fuser::mount2(data, mountpoint, &options).unwrap();
         }
-        Ok(Err(e)) => eprintln!("Error parsing JSON: {}", e),
-        Err(e) => eprintln!("IO Error: {}", e),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
     }
 }

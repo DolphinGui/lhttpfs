@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
+    error::Error,
     ffi::OsString,
-    fmt::Debug,
+    fmt::{Debug, Display},
     time::{Duration, UNIX_EPOCH},
 };
 
@@ -47,23 +48,37 @@ pub struct Directory {
     contents: Vec<InputFile>,
 }
 
+#[derive(Debug)]
+pub struct EmptyFilename();
+
+impl Display for EmptyFilename {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Empty filenames are not allowed")
+    }
+}
+
+impl Error for EmptyFilename {}
+
 impl LazyHTTPFS {
-    pub fn new(files: Vec<InputFile>) -> LazyHTTPFS {
+    pub fn new(files: Vec<InputFile>) -> Result<LazyHTTPFS, Box<dyn Error>> {
         let mut inode = 1;
         let root = InputFile::Directory(Directory {
             name: "/".into(),
             contents: files,
         });
-        let (mut r, _) = add_inodes(&[root], &mut inode);
+        let (mut r, _) = add_inodes(&[root], &mut inode)?;
         r.sort_unstable_by_key(|f| f.get_attr().ino);
-        LazyHTTPFS {
+        Ok(LazyHTTPFS {
             nodes: r,
             cache: HashMap::new(),
-        }
+        })
     }
 }
 
-fn add_inodes(files: &[InputFile], inode: &mut u64) -> (Vec<Node>, Vec<usize>) {
+fn add_inodes(
+    files: &[InputFile],
+    inode: &mut u64,
+) -> Result<(Vec<Node>, Vec<usize>), Box<dyn Error>> {
     let attr = FileAttr {
         ino: 0,
         size: 0,
@@ -84,6 +99,9 @@ fn add_inodes(files: &[InputFile], inode: &mut u64) -> (Vec<Node>, Vec<usize>) {
     let mut result = Vec::new();
     let mut toplev = Vec::new();
     for file in files {
+        if file.name().is_empty() {
+            return Err(Box::new(EmptyFilename()));
+        }
         match file {
             InputFile::URLFile(urlfile) => {
                 result.push(Node::FileNode(FileNode {
@@ -110,7 +128,7 @@ fn add_inodes(files: &[InputFile], inode: &mut u64) -> (Vec<Node>, Vec<usize>) {
                 let dir_index = result.len() - 1;
                 toplev.push(*inode as usize);
                 *inode += 1;
-                let (results, toplev) = add_inodes(&dir.contents, inode);
+                let (results, toplev) = add_inodes(&dir.contents, inode)?;
                 let inodes = toplev
                     .iter()
                     .zip(&dir.contents)
@@ -124,7 +142,7 @@ fn add_inodes(files: &[InputFile], inode: &mut u64) -> (Vec<Node>, Vec<usize>) {
             }
         }
     }
-    (result, toplev)
+    Ok((result, toplev))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -321,6 +339,8 @@ impl Filesystem for LazyHTTPFS {
 #[cfg(test)]
 mod test {
 
+    use crate::fs::EmptyFilename;
+
     use super::{Directory, InputFile, LazyHTTPFS, Node, URLFile};
 
     const JSON: &str = r#"
@@ -364,7 +384,7 @@ mod test {
     #[test]
     fn parsing() {
         let result: Vec<InputFile> = serde_json::from_str(JSON).unwrap();
-        let fs = LazyHTTPFS::new(result);
+        let fs = LazyHTTPFS::new(result).unwrap();
         for (inode, node) in fs.nodes.iter().enumerate() {
             println!("{}: {:?}\n", inode + 1, node);
             assert_eq!(inode as u64 + 1, node.get_attr().ino);
@@ -376,7 +396,7 @@ mod test {
     #[test]
     fn parsing2() {
         let result: Vec<InputFile> = serde_json::from_str(JSON2).unwrap();
-        let fs = LazyHTTPFS::new(result);
+        let fs = LazyHTTPFS::new(result).unwrap();
         let Node::DirNode(ref root) = fs.nodes[0] else {
             panic!("Root needs to be a directory");
         };
@@ -396,5 +416,13 @@ mod test {
                 }
             };
         }
+    }
+
+    #[test]
+    fn empty_file() {
+        let json = r#"[{"name":"", "size": 23, "url": "https://ping.archlinux.com/nm-check.txt"}]"#;
+        let result: Vec<InputFile> = serde_json::from_str(json).unwrap();
+        let fs = LazyHTTPFS::new(result);
+        assert!(fs.is_err_and(|e| e.is::<EmptyFilename>()));
     }
 }

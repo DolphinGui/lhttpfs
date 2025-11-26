@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     ffi::OsString,
+    fmt::Debug,
     time::{Duration, UNIX_EPOCH},
 };
 
@@ -53,7 +54,7 @@ impl LazyHTTPFS {
             name: "/".into(),
             contents: files,
         });
-        let mut r = add_inodes(&[root], &mut inode);
+        let (mut r, _) = add_inodes(&[root], &mut inode);
         r.sort_unstable_by_key(|f| f.get_attr().ino);
         LazyHTTPFS {
             nodes: r,
@@ -62,7 +63,7 @@ impl LazyHTTPFS {
     }
 }
 
-fn add_inodes(files: &[InputFile], inode: &mut u64) -> Vec<Node> {
+fn add_inodes(files: &[InputFile], inode: &mut u64) -> (Vec<Node>, Vec<usize>) {
     let attr = FileAttr {
         ino: 0,
         size: 0,
@@ -81,10 +82,10 @@ fn add_inodes(files: &[InputFile], inode: &mut u64) -> Vec<Node> {
         flags: 0,
     };
     let mut result = Vec::new();
+    let mut toplev = Vec::new();
     for file in files {
         match file {
             InputFile::URLFile(urlfile) => {
-                trace!("Inserting {}: {:?}", *inode, urlfile);
                 result.push(Node::FileNode(FileNode {
                     attr: FileAttr {
                         ino: *inode,
@@ -94,10 +95,10 @@ fn add_inodes(files: &[InputFile], inode: &mut u64) -> Vec<Node> {
                     },
                     url: urlfile.url.clone(),
                 }));
+                toplev.push(*inode as usize);
                 *inode += 1;
             }
             InputFile::Directory(dir) => {
-                trace!("Inserting {}: {:?}", *inode, dir);
                 result.push(Node::DirNode(DirNode {
                     attr: FileAttr {
                         ino: *inode,
@@ -107,23 +108,23 @@ fn add_inodes(files: &[InputFile], inode: &mut u64) -> Vec<Node> {
                     contents: HashMap::new(),
                 }));
                 let dir_index = result.len() - 1;
+                toplev.push(*inode as usize);
                 *inode += 1;
-                let results = add_inodes(&dir.contents, inode);
-                let inodes = results
+                let (results, toplev) = add_inodes(&dir.contents, inode);
+                let inodes = toplev
                     .iter()
                     .zip(&dir.contents)
-                    .map(|(f, input)| (OsString::from(input.name()), f.get_attr().ino))
-                    .collect();
+                    .map(|(inode, file)| (OsString::from(file.name()), *inode as u64));
                 result.extend(results.into_iter());
                 if let Some(Node::DirNode(n)) = result.get_mut(dir_index) {
-                    n.contents = inodes;
+                    n.contents = inodes.collect();
                 } else {
                     panic!("Directory indexing failed!");
                 }
             }
         }
     }
-    result
+    (result, toplev)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -148,16 +149,32 @@ impl Node {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 struct DirNode {
     attr: FileAttr,
     contents: HashMap<OsString, u64>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 struct FileNode {
     attr: FileAttr,
     url: String,
+}
+
+impl Debug for FileNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ino {}, url: {}, size: {}",
+            self.attr.ino, self.url, self.attr.size
+        )
+    }
+}
+
+impl Debug for DirNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ino {}, contents {:?}", self.attr.ino, self.contents)
+    }
 }
 
 const TTL: Duration = Duration::from_secs(1000000);
@@ -189,6 +206,7 @@ impl Filesystem for LazyHTTPFS {
             Node::DirNode(dir_node) => {
                 let f = dir_node.contents.get(name);
                 if let Some(file) = f.and_then(|i| self.get_inode(*i)) {
+                    trace!("Reply with {:?}", file);
                     reply.entry(&TTL, &file.get_attr(), 0)
                 } else {
                     reply.error(ENOENT)
@@ -228,7 +246,7 @@ impl Filesystem for LazyHTTPFS {
         let parent_dir = &self.get_inode(ino);
         match parent_dir {
             Some(Node::DirNode(dir)) => {
-                trace!("Directory contents: {:?}, offset {}", dir.contents, offset);
+                trace!("reading directory {} at offset {}", ino, offset);
                 let dots = [
                     (ino, &OsString::from("."), FileType::Directory),
                     (ino, &OsString::from(".."), FileType::Directory),
@@ -243,9 +261,9 @@ impl Filesystem for LazyHTTPFS {
                     .try_for_each(|(i, (inode, name, file))| -> Option<()> {
                         if reply.add(inode, (i + 1) as i64, file, name) {
                             trace!("READDIR listing file {}: {:?}", inode, name);
-                            Some(())
-                        } else {
                             None
+                        } else {
+                            Some(())
                         }
                     });
                 reply.ok();
@@ -302,7 +320,8 @@ impl Filesystem for LazyHTTPFS {
 
 #[cfg(test)]
 mod test {
-    use super::{Directory, InputFile, LazyHTTPFS, URLFile};
+
+    use super::{Directory, InputFile, LazyHTTPFS, Node, URLFile};
 
     const JSON: &str = r#"
 [
@@ -349,6 +368,33 @@ mod test {
         for (inode, node) in fs.nodes.iter().enumerate() {
             println!("{}: {:?}\n", inode + 1, node);
             assert_eq!(inode as u64 + 1, node.get_attr().ino);
+        }
+    }
+
+    const JSON2: &str = include_str!("models.json");
+
+    #[test]
+    fn parsing2() {
+        let result: Vec<InputFile> = serde_json::from_str(JSON2).unwrap();
+        let fs = LazyHTTPFS::new(result);
+        let Node::DirNode(ref root) = fs.nodes[0] else {
+            panic!("Root needs to be a directory");
+        };
+        for (inode, node) in fs.nodes.iter().enumerate() {
+            println!("{}: {:?}", inode, node);
+            assert_eq!(inode as u64 + 1, node.get_attr().ino);
+        }
+
+        for (name, inode) in root.contents.iter() {
+            match fs.get_inode(*inode).unwrap() {
+                Node::DirNode(_) => {}
+                Node::FileNode(ref f) => {
+                    panic!(
+                        "Expected directory for {:?} inode {}, got {:?}",
+                        name, *inode, f
+                    )
+                }
+            };
         }
     }
 }
